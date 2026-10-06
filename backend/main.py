@@ -194,3 +194,15 @@ def ask(
         for i, p in enumerate(passages, start=1)
     ]
     return {"answer": answer, "sources": sources}
+
+@app.delete("/documents/{doc_id}", status_code=204)
+def delete_document(
+    doc_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    doc = db.get(models.Document, doc_id)
+    if not doc or doc.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Document not found")
+    db.delete(doc)  # chunks are removed by the database's ON DELETE CASCADE
+    db.commit()
