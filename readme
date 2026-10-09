@@ -1,0 +1,42 @@
+# Health Knowledge Assistant
+
+A web app where users sign up, upload public health documents (PDF), and ask
+questions. An AI answers using only those documents and cites the pages it used.
+
+![Chat screenshot](docs/chat.png)
+
+## Features
+- Signup and login with JWT authentication and Argon2 password hashing
+- PDF upload, text extraction, chunking, and embeddings stored in PostgreSQL (pgvector)
+- Retrieval-Augmented Generation (RAG): answers come only from retrieved passages, with page citations
+- Relevance cutoff: unrelated questions get "I could not find this" instead of a guess
+- Per-user document isolation and ownership checks on delete
+- Retry with backoff when the LLM API is temporarily unavailable
+
+## Architecture
+Browser (Next.js) -> FastAPI -> PostgreSQL + pgvector
+                         |
+                         +-> Gemini API (embeddings and answers)
+
+## Tech stack
+Next.js, React, TypeScript, Tailwind | FastAPI, Python, SQLAlchemy, Pydantic |
+PostgreSQL + pgvector | Gemini API | Docker Compose | GitHub Actions | pytest
+
+## Run it locally
+1. Copy `backend/.env.example` to `backend/.env` and fill in your values
+2. `docker compose up --build`
+3. Open http://localhost:3001
+
+## Privacy
+Use only public documents or synthetic data. Never upload real patient data.
+
+## Testing
+`cd backend && pytest` (also runs in GitHub Actions on every push)
+
+## What I learned
+(Write 4 to 5 sentences in your own words: how RAG works, what broke, how you fixed it.)
+
+## Known limitations
+- Chunks are split by character count, so some cut mid-sentence
+- Broad questions ("summarize this document") retrieve only the top 4 chunks
+- Scanned PDFs without text are not supported
