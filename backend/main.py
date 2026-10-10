@@ -4,15 +4,16 @@ from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pypdf import PdfReader
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
-from rag import generate_answer
 
 import models
 import schemas
 from chunking import chunk_text
+from config import settings
 from database import Base, engine, get_db
 from embeddings import embed_documents, embed_query
+from rag import generate_answer
 from security import (
     create_access_token,
     decode_access_token,
@@ -20,7 +21,6 @@ from security import (
     verify_password,
 )
 
-# Creates the tables if they don't exist. We'll replace this with Alembic later.
 # The vector extension must exist before tables that use it
 with engine.begin() as conn:
     conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
@@ -28,15 +28,16 @@ with engine.begin() as conn:
 Base.metadata.create_all(engine)
 
 app = FastAPI(title="Health Knowledge Assistant")
-
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 app.add_middleware(
     CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=[o.strip() for o in settings.allowed_origins.split(",")],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+MAX_DISTANCE = 0.5  # chunks farther than this are treated as irrelevant
 
 
 @app.get("/health")
@@ -44,6 +45,7 @@ def health_check():
     return {"status": "ok"}
 
 
+# ---------------------------------------------------------------- auth
 @app.post("/auth/signup", response_model=schemas.UserOut, status_code=201)
 def signup(payload: schemas.UserCreate, db: Session = Depends(get_db)):
     existing = db.scalar(select(models.User).where(models.User.email == payload.email))
@@ -58,6 +60,7 @@ def signup(payload: schemas.UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
     return user
+
 
 @app.post("/auth/login", response_model=schemas.Token)
 def login(
@@ -84,6 +87,8 @@ def get_current_user(
 def me(current_user: models.User = Depends(get_current_user)):
     return current_user
 
+
+# ---------------------------------------------------------------- documents
 @app.post("/documents", status_code=201)
 def upload_document(
     file: UploadFile = File(...),
@@ -93,7 +98,38 @@ def upload_document(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    reader = PdfReader(io.BytesIO(file.file.read()))
+    already = db.scalar(
+        select(models.Document).where(
+            models.Document.user_id == current_user.id,
+            models.Document.filename == file.filename,
+        )
+    )
+    if already:
+        raise HTTPException(status_code=409, detail="Document already uploaded")
+
+    doc_count = db.scalar(
+        select(func.count())
+        .select_from(models.Document)
+        .where(models.Document.user_id == current_user.id)
+    )
+    if doc_count >= settings.max_documents_per_user:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Limit reached: {settings.max_documents_per_user} documents per user. Delete one first.",
+        )
+
+    data = file.file.read()
+    if len(data) > settings.max_upload_mb * 1024 * 1024:
+        raise HTTPException(
+            status_code=413, detail=f"File too large (max {settings.max_upload_mb} MB)"
+        )
+
+    reader = PdfReader(io.BytesIO(data))
+    if len(reader.pages) > settings.max_pdf_pages:
+        raise HTTPException(
+            status_code=400, detail=f"PDF too long (max {settings.max_pdf_pages} pages)"
+        )
+
     pieces = []  # list of (page_number, chunk_text)
     for page_num, page in enumerate(reader.pages, start=1):
         for chunk in chunk_text(page.extract_text() or ""):
@@ -132,6 +168,20 @@ def list_documents(
     return [{"id": d.id, "filename": d.filename} for d in docs]
 
 
+@app.delete("/documents/{doc_id}", status_code=204)
+def delete_document(
+    doc_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    doc = db.get(models.Document, doc_id)
+    if not doc or doc.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Document not found")
+    db.delete(doc)  # chunks are removed by the database's ON DELETE CASCADE
+    db.commit()
+
+
+# ---------------------------------------------------------------- search + RAG
 @app.get("/search")
 def search(
     q: str,
@@ -157,6 +207,7 @@ def search(
         for chunk, filename, dist in rows
     ]
 
+
 @app.post("/ask")
 def ask(
     question: str,
@@ -172,7 +223,6 @@ def ask(
         .order_by(distance)
         .limit(4)
     ).all()
-    MAX_DISTANCE = 0.5  # tune this using your own test questions
 
     passages = [
         {"filename": f, "page": c.page, "content": c.content}
@@ -184,9 +234,6 @@ def ask(
             "answer": "I could not find this in the uploaded documents.",
             "sources": [],
         }
-   
-    if not passages:
-        return {"answer": "No documents uploaded yet.", "sources": []}
 
     answer = generate_answer(question, passages)
     sources = [
@@ -194,15 +241,3 @@ def ask(
         for i, p in enumerate(passages, start=1)
     ]
     return {"answer": answer, "sources": sources}
-
-@app.delete("/documents/{doc_id}", status_code=204)
-def delete_document(
-    doc_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    doc = db.get(models.Document, doc_id)
-    if not doc or doc.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Document not found")
-    db.delete(doc)  # chunks are removed by the database's ON DELETE CASCADE
-    db.commit()
